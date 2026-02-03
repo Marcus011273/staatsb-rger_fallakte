@@ -1,99 +1,24 @@
 import streamlit as st
 from datetime import datetime
-import time
-import sqlite3
-from pathlib import Path
+import json
 
 # ----------------------------
 # CONFIG
 # ----------------------------
-st.set_page_config(page_title="Fallakte: Der umstrittene Schulbeschluss", page_icon="⚖️", layout="wide")
+st.set_page_config(
+    page_title="Fallakte: Der umstrittene Schulbeschluss",
+    page_icon="⚖️",
+    layout="wide",
+)
 
 CASE_TITLE = "Fallakte: Der umstrittene Schulbeschluss"
 CASE_ID = "Rosenfeld-23/26"
 
-DB_PATH = Path("case_store.sqlite")  # in repo/app working dir
-
-
 # ----------------------------
-# DB LAYER (SQLite)
+# URL PARAMS (Group)
 # ----------------------------
-@st.cache_resource
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS submissions (
-            group_name TEXT PRIMARY KEY,
-            vote TEXT,
-            reasoning TEXT,
-            role TEXT,
-            ts TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """
-    )
-    # init solution flag if missing
-    cur = conn.execute("SELECT value FROM settings WHERE key='solution_released'")
-    row = cur.fetchone()
-    if row is None:
-        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('solution_released', '0')")
-        conn.commit()
-    return conn
-
-
-def db_get_solution_released(conn) -> bool:
-    row = conn.execute("SELECT value FROM settings WHERE key='solution_released'").fetchone()
-    return bool(int(row[0])) if row else False
-
-
-def db_set_solution_released(conn, released: bool):
-    conn.execute(
-        "INSERT OR REPLACE INTO settings(key, value) VALUES('solution_released', ?)",
-        ("1" if released else "0",),
-    )
-    conn.commit()
-
-
-def db_upsert_submission(conn, group_name: str, vote: str, reasoning: str, role: str, ts: str):
-    conn.execute(
-        """
-        INSERT INTO submissions(group_name, vote, reasoning, role, ts)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(group_name) DO UPDATE SET
-            vote=excluded.vote,
-            reasoning=excluded.reasoning,
-            role=excluded.role,
-            ts=excluded.ts
-        """,
-        (group_name, vote, reasoning, role, ts),
-    )
-    conn.commit()
-
-
-def db_get_submissions(conn):
-    rows = conn.execute("SELECT group_name, vote, reasoning, role, ts FROM submissions ORDER BY lower(group_name)").fetchall()
-    subs = []
-    for r in rows:
-        subs.append(
-            {"group_name": r[0], "vote": r[1], "reasoning": r[2], "role": r[3], "timestamp": r[4]}
-        )
-    return subs
-
-
-def db_clear_submissions(conn):
-    conn.execute("DELETE FROM submissions")
-    conn.commit()
-
+params = st.query_params  # Streamlit >= 1.30
+group_id = params.get("group", "")
 
 # ----------------------------
 # STATE INIT
@@ -108,31 +33,18 @@ def init_state():
         "vote": None,
         "reasoning": "",
         "timestamp": None,
-        "is_moderator": False,
-        "auto_refresh": True,
+        "saved_payload": None,
+        "show_solution": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 init_state()
-conn = get_db()
 
-# ----------------------------
-# URL PARAMS (Moderator/Group)
-# ----------------------------
-params = st.query_params  # Streamlit >= 1.30
-mode = params.get("mode", "group")  # "group" or "moderator"
-group_id = params.get("group", "")
-
-if mode == "moderator":
-    st.session_state["is_moderator"] = True
-else:
-    st.session_state["is_moderator"] = False
-    if group_id and not st.session_state.get("group_name"):
-        st.session_state["group_name"] = f"Gruppe {group_id}"
-
+# Prefill group name from URL, and lock it (stable links)
+if group_id and not st.session_state["group_name"]:
+    st.session_state["group_name"] = f"Gruppe {group_id}"
 
 # ----------------------------
 # HELPERS
@@ -148,19 +60,13 @@ def badge(text: str):
         unsafe_allow_html=True,
     )
 
-
 def section_title(icon, title):
     st.markdown(f"## {icon} {title}")
 
-
 def reset_session():
-    # resets only current session state, not DB
     for k in list(st.session_state.keys()):
         del st.session_state[k]
     st.rerun()
-
-
-solution_released = db_get_solution_released(conn)
 
 # ----------------------------
 # SIDEBAR
@@ -169,19 +75,13 @@ with st.sidebar:
     st.title("⚖️ Fallakte")
     st.caption(f"ID: {CASE_ID}")
 
-    if st.session_state["is_moderator"]:
-        st.success("Modus: Moderator/Beamer")
-        st.caption("Link: ?mode=moderator")
-    else:
-        st.info("Modus: Gruppe")
-        if group_id:
-            st.caption(f"Link: ?mode=group&group={group_id}")
-
+    # Group name: locked if group param exists
     st.session_state["group_name"] = st.text_input(
         "Gruppe / Name",
         st.session_state["group_name"],
         placeholder="z. B. Gruppe 2",
-        disabled=st.session_state["is_moderator"],
+        disabled=bool(group_id),
+        help="Wenn du einen Gruppenlink mit ?group=… nutzt, ist der Name fest.",
     )
 
     st.session_state["role"] = st.selectbox(
@@ -192,100 +92,25 @@ with st.sidebar:
 
     st.divider()
 
-    steps = ["Fallakte", "Checkpoints", "Entscheidung", "Auflösung"]
-    if st.session_state["is_moderator"]:
-        steps = ["Live-Board"] + steps
-
-    if st.session_state["step"] not in steps:
-        st.session_state["step"] = steps[0]
-
-    st.session_state["step"] = st.radio("Navigation", steps, index=steps.index(st.session_state["step"]))
+    st.session_state["step"] = st.radio(
+        "Navigation",
+        ["Fallakte", "Checkpoints", "Entscheidung", "Auflösung"],
+        index=["Fallakte", "Checkpoints", "Entscheidung", "Auflösung"].index(st.session_state["step"]),
+    )
 
     st.divider()
-    st.caption("Moderation")
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        if st.button("🔄 Session-Reset", use_container_width=True):
-            reset_session()
-
-    with col_b:
-        if st.session_state["is_moderator"]:
-            new_flag = st.toggle("Lösung freigeben", value=solution_released)
-            if new_flag != solution_released:
-                db_set_solution_released(conn, new_flag)
-                solution_released = new_flag
-        else:
-            st.toggle("Lösung freigeben", value=solution_released, disabled=True)
-
-    if st.session_state["is_moderator"]:
-        st.divider()
-        st.session_state["auto_refresh"] = st.toggle("Live aktualisieren", value=st.session_state.get("auto_refresh", True))
-        if st.button("🧹 Alle Abgaben löschen", use_container_width=True):
-            db_clear_submissions(conn)
-            st.success("Alle Abgaben gelöscht.")
-            st.rerun()
-
+    if st.button("🔄 Alles zurücksetzen", use_container_width=True):
+        reset_session()
 
 # ----------------------------
 # HEADER
 # ----------------------------
 st.title(CASE_TITLE)
 badge(f"ID: {CASE_ID}")
-badge(f"Perspektive: {st.session_state['role']}")
-if not st.session_state["is_moderator"] and st.session_state["group_name"].strip():
+if st.session_state["group_name"].strip():
     badge(f"Gruppe: {st.session_state['group_name']}")
+badge(f"Perspektive: {st.session_state['role']}")
 st.caption("Ziel: urteilsbildend arbeiten (Zuständigkeit → Grundrechte → Neutralität → Verhältnismäßigkeit).")
-
-# ----------------------------
-# LIVE-BOARD (MODERATOR)
-# ----------------------------
-if st.session_state["step"] == "Live-Board":
-    section_title("📡", "Live-Board (Moderator/Beamer)")
-
-    subs = db_get_submissions(conn)
-
-    left, mid, right = st.columns([0.52, 0.28, 0.20])
-
-    with left:
-        st.markdown("### Eingänge")
-        if subs:
-            for s in subs:
-                st.markdown(f"**{s['group_name']}** — **{s['vote'] or '—'}**  \n_{s['timestamp'] or '—'}_")
-                snippet = (s["reasoning"] or "").strip()
-                if snippet:
-                    st.caption(snippet[:220] + ("…" if len(snippet) > 220 else ""))
-                st.divider()
-        else:
-            st.info("Noch keine Gruppenabgaben.")
-
-    with mid:
-        st.markdown("### Abstimmungsbild")
-        counts = {"Ja": 0, "Nein": 0, "Teilweise": 0}
-        for s in subs:
-            if s["vote"] in counts:
-                counts[s["vote"]] += 1
-        st.write(counts)
-
-        st.markdown("### Status")
-        st.write(f"Abgaben: **{len(subs)}**")
-
-        st.markdown("### Lösung")
-        solution_released = db_get_solution_released(conn)
-        st.write("Freigegeben:" + (" ✅" if solution_released else " ❌"))
-
-    with right:
-        st.markdown("### Steuerung")
-        if st.button("↻ Jetzt aktualisieren", use_container_width=True):
-            st.rerun()
-
-        st.caption("Auto-Refresh (alle ~2s)")
-        if st.session_state.get("auto_refresh", True):
-            time.sleep(2)
-            st.rerun()
-
-    st.stop()
-
 
 # ----------------------------
 # FALLAKTE
@@ -323,7 +148,6 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
     with right:
         st.markdown("### 📎 Dokumente (simuliert)")
         tab1, tab2, tab3, tab4 = st.tabs(["Stadtratsbeschluss", "Elternbeschwerde", "Schulleitung", "Presseauszug"])
-
         with tab1:
             st.markdown(
                 """
@@ -337,7 +161,6 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
 2) Behandlung aktueller politischer Konflikte im Unterricht untersagt.
 """
             )
-
         with tab2:
             st.markdown(
                 """
@@ -348,7 +171,6 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
 - Bitte rechtliche Prüfung und Aufhebung
 """
             )
-
         with tab3:
             st.markdown(
                 """
@@ -358,7 +180,6 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
 - Wunsch nach klaren Vorgaben „von oben“
 """
             )
-
         with tab4:
             st.markdown(
                 """
@@ -368,9 +189,7 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
             )
 
     st.divider()
-    st.markdown("### ✅ Nächster Schritt")
-    st.write("Geht zu **Checkpoints**, um eure Analyse strukturiert vorzubereiten.")
-
+    st.write("Weiter mit **Checkpoints**.")
 
 # ----------------------------
 # CHECKPOINTS
@@ -378,8 +197,7 @@ Ihr seid ein unabhängiges Gremium und gebt eine begründete Empfehlung ab:
 elif st.session_state["step"] == "Checkpoints":
     section_title("🧩", "Checkpoints (Analysefragen)")
 
-    st.markdown("Beantwortet die Fragen. Danach bekommt ihr Rückmeldung zur Argumentationsrichtung.")
-    st.caption("Hinweis: Es geht um Logik & Struktur – nicht ums Auswendiglernen.")
+    st.markdown("Beantwortet die Fragen. Danach bekommt ihr Feedback zur Argumentationsrichtung.")
 
     questions = [
         {
@@ -412,8 +230,6 @@ elif st.session_state["step"] == "Checkpoints":
         },
     ]
 
-    st.session_state["mc_answers"] = st.session_state.get("mc_answers", {})
-
     for q in questions:
         st.session_state["mc_answers"][q["id"]] = st.radio(
             q["prompt"],
@@ -424,27 +240,20 @@ elif st.session_state["step"] == "Checkpoints":
         )
         st.write("")
 
-    col1, col2 = st.columns([0.35, 0.65])
-    with col1:
-        if st.button("✅ Check auswerten", use_container_width=True):
-            st.session_state["checks_done"] = True
+    if st.button("✅ Check auswerten", use_container_width=True):
+        st.session_state["checks_done"] = True
 
-    with col2:
-        if st.session_state["checks_done"]:
-            score = 0
-            feedback_lines = []
-            for q in questions:
-                a = st.session_state["mc_answers"].get(q["id"], 0)
-                if a == q["correct"]:
-                    score += 1
-                    feedback_lines.append(f"✅ {q['prompt']} – passt.")
-                else:
-                    feedback_lines.append(f"⚠️ {q['prompt']} – Hinweis: {q['explain']}")
+    if st.session_state["checks_done"]:
+        score = 0
+        for q in questions:
+            if st.session_state["mc_answers"].get(q["id"], 0) == q["correct"]:
+                score += 1
 
-            st.success(f"Checkpoint-Stand: {score}/{len(questions)}")
-            st.markdown("\n".join(feedback_lines))
-            st.info("Weiter zu **Entscheidung**." if score >= 3 else "Nochmal nachschärfen, dann zu **Entscheidung**.")
-
+        st.success(f"Checkpoint-Stand: {score}/{len(questions)}")
+        if score >= 3:
+            st.info("Ihr seid auf Kurs. Weiter zu **Entscheidung**.")
+        else:
+            st.warning("Noch wackelig – schaut in die Fallakte und korrigiert eure Argumentationslinie.")
 
 # ----------------------------
 # DECISION
@@ -452,16 +261,11 @@ elif st.session_state["step"] == "Checkpoints":
 elif st.session_state["step"] == "Entscheidung":
     section_title("🗳️", "Entscheidung & Begründung")
 
-    if st.session_state["is_moderator"]:
-        st.info("Moderator kann mitlesen, aber nicht als Gruppe abgeben (Gruppenlink nutzen).")
-
     default_vote = st.session_state["vote"] if st.session_state["vote"] else "Nein"
-
     st.session_state["vote"] = st.radio(
         "Ist der Beschluss rechtmäßig?",
         ["Ja", "Nein", "Teilweise"],
         index=["Ja", "Nein", "Teilweise"].index(default_vote),
-        disabled=st.session_state["is_moderator"],
     )
 
     st.session_state["reasoning"] = st.text_area(
@@ -476,23 +280,9 @@ elif st.session_state["step"] == "Entscheidung":
             "4) Verhältnismäßigkeit\n"
             "→ Ergebnis"
         ),
-        disabled=st.session_state["is_moderator"],
     )
 
-    cols = st.columns([0.4, 0.6])
-    with cols[0]:
-        if st.button("📌 Entscheidung speichern", use_container_width=True, disabled=st.session_state["is_moderator"]):
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state["timestamp"] = ts
-
-            gname = st.session_state["group_name"].strip() or (f"Gruppe {group_id}" if group_id else "Unbenannt")
-            db_upsert_submission(conn, gname, st.session_state["vote"], st.session_state["reasoning"], st.session_state["role"], ts)
-            st.success("Gespeichert (im Live-Board sichtbar).")
-
-    with cols[1]:
-        st.caption("Tipp: Nenne mind. 3 Bausteine: Zuständigkeit, Neutralität, Verhältnismäßigkeit (plus Grundrechte).")
-
-    st.divider()
+    # Mini-Feedback (fix ohne DeltaGenerator-Ausgabe)
     st.markdown("### 🧠 Mini-Feedback (ohne KI)")
     if st.session_state["reasoning"].strip():
         text = st.session_state["reasoning"].lower()
@@ -505,11 +295,41 @@ elif st.session_state["step"] == "Entscheidung":
         }
         found = [label for key, label in hits.items() if key in text]
         missing = [label for label in hits.values() if label not in found]
+
         st.write(f"Erkannte Bausteine: **{', '.join(found) if found else '—'}**")
-        st.warning("Fehlt evtl. noch: " + ", ".join(missing)) if missing else st.success("Sehr rund: Alle Kernbausteine sind drin.")
+        if missing:
+            st.warning("Fehlt evtl. noch: " + ", ".join(missing))
+        else:
+            st.success("Sehr rund: Alle Kernbausteine sind drin.")
     else:
         st.info("Schreib eine kurze Begründung – dann bekommst du Struktur-Feedback.")
 
+    st.divider()
+
+    col1, col2 = st.columns([0.45, 0.55])
+    with col1:
+        if st.button("📌 Abgabe speichern & Lösung freischalten", use_container_width=True):
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state["timestamp"] = ts
+
+            payload = {
+                "case_id": CASE_ID,
+                "group": st.session_state["group_name"].strip() or (f"Gruppe {group_id}" if group_id else "Unbenannt"),
+                "role": st.session_state["role"],
+                "vote": st.session_state["vote"],
+                "reasoning": st.session_state["reasoning"],
+                "timestamp": ts,
+            }
+            st.session_state["saved_payload"] = payload
+            st.session_state["show_solution"] = True
+            st.success("Gespeichert. Die Auflösung ist jetzt für eure Gruppe sichtbar.")
+
+    with col2:
+        st.caption("Optional: Du kannst eure Abgabe als Textblock kopieren (z. B. in ein gemeinsames Pad).")
+
+    if st.session_state.get("saved_payload"):
+        st.markdown("### 📋 Abgabe (zum Kopieren)")
+        st.code(json.dumps(st.session_state["saved_payload"], ensure_ascii=False, indent=2), language="json")
 
 # ----------------------------
 # SOLUTION
@@ -517,9 +337,8 @@ elif st.session_state["step"] == "Entscheidung":
 elif st.session_state["step"] == "Auflösung":
     section_title("✅", "Auflösung & Musterlösung")
 
-    solution_released = db_get_solution_released(conn)
-    if not solution_released:
-        st.warning("Die Lösung ist noch nicht freigegeben (nur Moderator kann das in der Sidebar).")
+    if not st.session_state.get("show_solution", False):
+        st.warning("Für eure Gruppe ist die Auflösung noch gesperrt. Geht zu **Entscheidung** und speichert eure Abgabe.")
         st.stop()
 
     st.success("**Ergebnis:** Der Beschluss ist **rechtswidrig** (mindestens in wesentlichen Teilen).")
@@ -550,7 +369,7 @@ Der Beschluss ist rechtswidrig; zulässig wären allenfalls eng begrenzte organi
     )
 
     st.divider()
-    st.markdown("### 🎓 Transferfrage fürs Seminar (Chef-Moment)")
+    st.markdown("### 🎓 Transferfrage")
     st.markdown(
         """
 **Welche Kompetenzen würden Schülerinnen und Schüler durch diesen Fall erwerben?**  
@@ -561,15 +380,12 @@ Der Beschluss ist rechtswidrig; zulässig wären allenfalls eng begrenzte organi
 """
     )
 
-    st.divider()
-    st.markdown("### 🧾 Eure gespeicherte Entscheidung (falls vorhanden)")
-    if st.session_state.get("timestamp"):
-        st.write(f"**Zeit:** {st.session_state['timestamp']}")
-        st.write(f"**Entscheidung:** {st.session_state['vote']}")
+    if st.session_state.get("saved_payload"):
+        st.divider()
+        st.markdown("### 🧾 Eure Abgabe (Kurzcheck)")
+        st.write(f"**Entscheidung:** {st.session_state['saved_payload']['vote']}")
+        st.write(f"**Zeit:** {st.session_state['saved_payload']['timestamp']}")
         st.write("**Begründung:**")
-        st.write(st.session_state["reasoning"] if st.session_state["reasoning"].strip() else "—")
-    else:
-        st.info("Noch nichts gespeichert – geht zu **Entscheidung** und speichert eure Begründung.")
+        st.write(st.session_state["saved_payload"]["reasoning"] or "—")
 
-
-st.caption("© Seminar-Fallakte – Cloud-tauglich mit SQLite. Tipp: Gruppenlinks per QR-Code teilen (optional).")
+st.caption("© Seminar-Fallakte – Gruppenlinks stabil über ?group=… | Keine Moderatoren-Synchronisation nötig.")
