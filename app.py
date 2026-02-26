@@ -11,7 +11,7 @@ st.set_page_config(
     layout="wide",
 )
 
-CASE_TITLE = "Fallakte: Der umstrittene Schulbeschluss"
+CASE_TITLE = "Fallakte: Der umstrittene Schulbeschluss - gelöst von Seminar 45.2"
 CASE_ID = "Rosenfeld-23/26"
 
 # ----------------------------
