@@ -6,7 +6,7 @@ import json
 # CONFIG
 # ----------------------------
 st.set_page_config(
-    page_title="Fallakte: Der umstrittene Schulbeschluss",
+    page_title="Fallakte: Der umstrittene Schulbeschluss - Seminar 45.2",
     page_icon="⚖️",
     layout="wide",
 )
